@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+trap 'zenity --error --title="rushforge" --text="Script failed unexpectedly on line $LINENO." 2>/dev/null' ERR
+
+decode_uri() {
+    python3 -c "from urllib.parse import unquote; import sys; print(unquote(sys.argv[1]).removeprefix('file://'))" "$1"
+}
+
+# Support two workflows:
+#   1. Right-click the folder itself from its parent (no thumbnail rendering)
+#   2. Open the folder, Ctrl+A, right-click any selected file
+FIRST_SELECTED=$(echo "$NAUTILUS_SCRIPT_SELECTED_URIS" | head -1)
+SELECTED_PATH=$(decode_uri "$FIRST_SELECTED")
+SELECTED_COUNT=$(echo "$NAUTILUS_SCRIPT_SELECTED_URIS" | grep -c .)
+
+if [ "$SELECTED_COUNT" -eq 1 ] && [ -d "$SELECTED_PATH" ]; then
+    TARGET_DIR="$SELECTED_PATH"
+else
+    TARGET_DIR=$(decode_uri "$NAUTILUS_SCRIPT_CURRENT_URI")
+fi
+
+# Pipe rushforge output into a pulsating progress bar.
+# Lines matching "Processing:" and "[OK]"/[SKIP]" update the label so the
+# user can see which file is active. rushforge still writes its full log.
+(
+    ~/.local/bin/rushforge "$TARGET_DIR"
+    echo "RUSHFORGE_EXIT:$?"
+) 2>&1 | \
+    stdbuf -oL grep -E "^(Processing|Probing|\[OK\]|\[SKIP\]|\[ERROR\]|RUSHFORGE_EXIT)" | \
+    (
+        while IFS= read -r line; do
+            if [[ "$line" == RUSHFORGE_EXIT:* ]]; then
+                echo "${line#RUSHFORGE_EXIT:}" > /tmp/rushforge_exit
+            else
+                echo "# $line"
+            fi
+        done
+    ) | zenity --progress \
+        --title="rushforge" \
+        --text="Transcoding clips in:\n$TARGET_DIR" \
+        --pulsate \
+        --auto-close
+
+EXIT_CODE=$(cat /tmp/rushforge_exit 2>/dev/null || echo 1)
+rm -f /tmp/rushforge_exit
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+    notify-send "rushforge" "Done! Files ready in:\n$TARGET_DIR/resolve_ready"
+else
+    notify-send --urgency=critical "rushforge" "One or more files failed. Check rushforge.log in resolve_ready/"
+fi

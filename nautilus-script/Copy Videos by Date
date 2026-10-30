@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+trap 'zenity --error --title="Copy Videos by Date" --text="Script failed unexpectedly on line $LINENO." 2>/dev/null' ERR
+
+decode_uri() {
+    python3 -c "from urllib.parse import unquote; import sys; print(unquote(sys.argv[1]).removeprefix('file://'))" "$1"
+}
+
+# Support two workflows:
+#   1. Right-click the folder itself from its parent (no thumbnail rendering)
+#   2. Open the folder, Ctrl+A, right-click any selected file
+FIRST_SELECTED=$(echo "$NAUTILUS_SCRIPT_SELECTED_URIS" | head -1)
+SELECTED_PATH=$(decode_uri "$FIRST_SELECTED")
+SELECTED_COUNT=$(echo "$NAUTILUS_SCRIPT_SELECTED_URIS" | grep -c .)
+
+if [ "$SELECTED_COUNT" -eq 1 ] && [ -d "$SELECTED_PATH" ]; then
+    TARGET_DIR="$SELECTED_PATH"
+else
+    TARGET_DIR=$(decode_uri "$NAUTILUS_SCRIPT_CURRENT_URI")
+fi
+
+# --- Period selection ---
+PERIOD=$(zenity --list \
+    --title="Copy Videos by Date" \
+    --text="Select time period:" \
+    --column="Period" \
+    --hide-header \
+    --height=260 \
+    "Today" "Yesterday" "This Week" "Custom Range")
+
+[ -z "$PERIOD" ] && exit 0
+
+today=$(date +%Y-%m-%d)
+tomorrow=$(date -d "tomorrow" +%Y-%m-%d)
+
+case "$PERIOD" in
+    "Today")
+        since="$today"
+        until_excl="$tomorrow"
+        label="$today"
+        ;;
+    "Yesterday")
+        since=$(date -d "yesterday" +%Y-%m-%d)
+        until_excl="$today"
+        label="$since"
+        ;;
+    "This Week")
+        since=$(date -d "7 days ago" +%Y-%m-%d)
+        until_excl="$tomorrow"
+        label="${since}_to_${today}"
+        ;;
+    "Custom Range")
+        since=$(zenity --calendar \
+            --title="Start date" \
+            --text="Select start date:" \
+            --date-format="%Y-%m-%d") || exit 0
+
+        until=$(zenity --calendar \
+            --title="End date" \
+            --text="Select end date:" \
+            --date-format="%Y-%m-%d") || exit 0
+
+        until_excl=$(date -d "$until + 1 day" +%Y-%m-%d)
+        label="${since}_to_${until}"
+        ;;
+esac
+
+# --- Destination ---
+DEST_BASE=$(zenity --file-selection \
+    --title="Copy videos to..." \
+    --directory) || exit 0
+
+DEST="$DEST_BASE/$label"
+
+# --- Find matching video files ---
+# MTP-mounted phones (GVFS) expose unreliable mtimes, so prefer the date
+# embedded in Samsung filenames (YYYYMMDD_HHMMSS.mp4 / VID_YYYYMMDD_...).
+# Fall back to mtime for files without a recognisable date in the name.
+get_file_date() {
+    local filename validated raw
+    filename=$(basename "$1")
+    # Try each 8-digit run in the filename as a potential YYYYMMDD.
+    # Validate with `date -d` so serials and impossible dates (e.g. month 13) are rejected.
+    while [[ "$filename" =~ ([0-9]{8}) ]]; do
+        raw="${BASH_REMATCH[1]}"
+        validated=$(date -d "${raw:0:4}-${raw:4:2}-${raw:6:2}" +%Y-%m-%d 2>/dev/null)
+        if [ -n "$validated" ]; then
+            echo "$validated"
+            return
+        fi
+        filename="${filename#*"$raw"}"
+    done
+    # Fall back to mtime (unreliable on MTP but works for local folders)
+    stat -c "%y" "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+mapfile -t ALL_VIDEOS < <(find "$TARGET_DIR" -maxdepth 1 -type f \
+    \( -iname "*.mp4" -o -iname "*.mov" -o -iname "*.mkv" \))
+
+FILES=()
+for f in "${ALL_VIDEOS[@]}"; do
+    file_date=$(get_file_date "$f")
+    if [[ ! "$file_date" < "$since" && "$file_date" < "$until_excl" ]]; then
+        FILES+=("$f")
+    fi
+done
+
+if [ ${#FILES[@]} -eq 0 ]; then
+    zenity --info \
+        --title="Copy Videos by Date" \
+        --text="No video files found for the selected period."
+    exit 0
+fi
+
+# --- Copy with progress bar ---
+mkdir -p "$DEST"
+TOTAL=${#FILES[@]}
+notify-send "Copy Videos" "Found $TOTAL file(s) — copying to $DEST"
+
+ERRFILE=$(mktemp)
+echo 0 > "$ERRFILE"
+
+(
+    i=0
+    for f in "${FILES[@]}"; do
+        echo "# $(basename "$f")"
+        cp "$f" "$DEST/" || echo $(($(cat "$ERRFILE") + 1)) > "$ERRFILE"
+        i=$((i + 1))
+        echo $((i * 100 / TOTAL))
+    done
+) | zenity --progress \
+    --title="Copy Videos by Date" \
+    --text="Copying $TOTAL file(s) to $DEST…" \
+    --percentage=0 \
+    --auto-close \
+    --no-cancel
+
+ERRORS=$(cat "$ERRFILE")
+rm -f "$ERRFILE"
+
+if [ "$ERRORS" -eq 0 ]; then
+    notify-send "Copy Videos" "Done! $TOTAL file(s) copied to:\n$DEST"
+else
+    notify-send --urgency=critical "Copy Videos" "$ERRORS file(s) failed. Check $DEST"
+fi

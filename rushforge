@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+INPUT_DIR="${1:-.}"
+OUTPUT_DIR="${INPUT_DIR}/resolve_ready"
+LOG_FILE="${OUTPUT_DIR}/rushforge.log"
+
+mkdir -p "$OUTPUT_DIR"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== rushforge started: $(date) ==="
+
+shopt -s nullglob nocaseglob
+FILES=("$INPUT_DIR"/*.mp4 "$INPUT_DIR"/*.mov "$INPUT_DIR"/*.mkv)
+
+if [ ${#FILES[@]} -eq 0 ]; then
+    echo "No video files found in $INPUT_DIR"
+    exit 0
+fi
+
+echo "Found ${#FILES[@]} clips. Output: $OUTPUT_DIR"
+
+ERRORS=0
+
+for file in "${FILES[@]}"; do
+    filename=$(basename "$file")
+    base="${filename%.*}"
+    outfile="$OUTPUT_DIR/${base}_ready.mov"
+
+    echo "==========================================="
+    echo "Probing:    $filename"
+    echo "==========================================="
+
+    vcodec=$(ffprobe -v quiet -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | tr '\n' ' ')
+    acodec=$(ffprobe -v quiet -select_streams a:0 \
+        -show_entries stream=codec_name,sample_rate \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | tr '\n' ' ')
+
+    # Already Resolve-ready: DNxHR + yuv422p video, PCM 48kHz audio.
+    if [[ "$vcodec" == *"dnxhd"* && "$vcodec" == *"yuv422p"* \
+       && "$acodec" == *"pcm_s16le"* && "$acodec" == *"48000"* ]]; then
+        echo "[SKIP] $filename is already Resolve-ready."
+        continue
+    fi
+
+    # Clean up any partial output left by a previous interrupted run.
+    rm -f "$outfile"
+
+    echo "Processing: $filename"
+
+    # Select the right CUDA decoder. Samsung A56 encodes in HEVC;
+    # h264_cuvid / hevc_cuvid unlock full GPU decode rather than falling back to CPU.
+    case "${vcodec%% *}" in
+        h264) hwdec="-hwaccel cuda -c:v h264_cuvid" ;;
+        hevc) hwdec="-hwaccel cuda -c:v hevc_cuvid" ;;
+        *)    hwdec="-hwaccel cuda" ;;
+    esac
+
+    # shellcheck disable=SC2086
+    if ffmpeg -y -hide_banner \
+        $hwdec \
+        -i "$file" \
+        -c:v dnxhd \
+        -profile:v dnxhr_sq \
+        -pix_fmt yuv422p \
+        -c:a pcm_s16le \
+        -ar 48000 \
+        "$outfile"; then
+        echo "[OK] $outfile"
+    else
+        echo "[ERROR] Failed on $filename — skipping."
+        rm -f "$outfile"
+        ERRORS=$((ERRORS + 1))
+    fi
+done
+
+echo ""
+echo "=== rushforge done: $(date) | Errors: $ERRORS ==="
+[ "$ERRORS" -eq 0 ]
