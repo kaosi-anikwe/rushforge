@@ -38,6 +38,9 @@ for file in "${FILES[@]}"; do
     acodec=$(ffprobe -v quiet -select_streams a:0 \
         -show_entries stream=codec_name,sample_rate \
         -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | tr '\n' ' ')
+    fps=$(ffprobe -v quiet -select_streams v:0 \
+        -show_entries stream=avg_frame_rate \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
 
     # Already Resolve-ready: DNxHR + yuv422p video, PCM 48kHz audio.
     if [[ "$vcodec" == *"dnxhd"* && "$vcodec" == *"yuv422p"* \
@@ -66,6 +69,7 @@ for file in "${FILES[@]}"; do
         -c:v dnxhd \
         -profile:v dnxhr_sq \
         -pix_fmt yuv422p \
+        -r "$fps" -fps_mode cfr \
         -c:a pcm_s16le \
         -ar 48000 \
         "$outfile"; then
